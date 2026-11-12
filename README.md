@@ -48,7 +48,7 @@ What Steep needs a server for, and how far Powder covers it.
 | Rider card and favorites                         | ✅     |                                                                                                                                        |
 | Personal best per challenge                      | ✅     | Stored on the server                                                                                                                   |
 | Achievements                                     | ✅     | Stored per player; names and icons in Ubisoft Connect need the game-data pack                                                          |
-| Taking over your progress from Ubisoft's servers | 🟡     | Only from recordings of your own online sessions, via the command line (`admin import`); players can't make such recordings themselves |
+| Taking over your progress from Ubisoft's servers | 🟡     | From recordings of your own online sessions via `admin import`; the source-tree capture tool records HTTPS/demux state, but not encrypted NEX statistics |
 
 ### Competing and sharing
 
@@ -132,6 +132,12 @@ sessions; when installed, its replies take precedence over the built-in ones:
 uv run powder-server gamedata build <recordings> gamedata    # allow-list + privacy check
 uv run powder-server gamedata verify                         # manifest + file hashes
 ```
+
+To make those recordings on Windows from a legitimately installed TU7 copy, use the source-tree
+[`tools/capture`](tools/capture/README.md) collector. It uses per-process local interception (not system
+proxy settings), reuses Powder's verified Steep TLS helper, writes a semantic coverage report, and removes
+its temporary capture certificate on exit. Raw recordings contain account data and must never be shared;
+only the pack produced after the builder's privacy check is intended to leave the capture PC.
 
 The builder copies only allow-listed, game-wide replies. Before writing the pack it collects every
 identifying value from the recordings (account and profile ids, names, email, tickets, friends, other

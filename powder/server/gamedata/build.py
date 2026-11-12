@@ -22,13 +22,15 @@ from . import pack, privacy
 
 GUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 ID = f"(?:{GUID}|global|all)"
+APP = re.escape(APP_ID)
+SPACE = re.escape(SPACE_ID)
 
 # (method, path regex without query): game-wide configuration only, nothing under a profile or user
 GAME_ALLOW = [
-    ("GET", rf"/v2/applications/{GUID}/configuration"),
-    ("GET", rf"/v1/spaces/{GUID}/configs/primarystore"),
-    ("GET", rf"/v4/spaces/{GUID}/configs/events"),
-    ("GET", rf"/v1/spaces/{GUID}/items/all"),
+    ("GET", rf"/v2/applications/{APP}/configuration"),
+    ("GET", rf"/v1/spaces/{SPACE}/configs/primarystore"),
+    ("GET", rf"/v4/spaces/{SPACE}/configs/events"),
+    ("GET", rf"/v1/spaces/{SPACE}/items/all"),
     ("GET", r"/v2/spaces/global/ubiconnect/challenges/api/legacy/empty"),
 ]
 CONNECT_ALLOW = [
@@ -51,7 +53,7 @@ CONNECT_ALLOW = [
 ]
 RMC_ALLOW = {"GameStorageProtocol::GetGameParamaters_V1", "SteepTournamentProtocol::FetchSeasonInfo_V1"}
 STEEP_PRODUCTS = {3279, 3280}                      # Steam entry + Ubisoft product; their add-ons follow
-OFFERS_PATH = re.compile(rf"/v1/spaces/{GUID}/offers$")
+OFFERS_PATH = re.compile(rf"/v1/spaces/{SPACE}/offers$")
 ACTIONS_PATH = re.compile(rf"/v1/profiles/{GUID}/actions$")
 ACTION_PLAYER_FIELDS = ("profileId", "value")       # per-player state in an action
 
@@ -79,6 +81,14 @@ def _body(e: dict):
     return json.loads(base64.b64decode(e["body_b64"]))
 
 
+def _successful(e: dict) -> bool:
+    """Only replay successful upstream responses; failures remain privacy-marker sources."""
+    try:
+        return 200 <= int(e.get("status", 0)) < 300
+    except (TypeError, ValueError):
+        return False
+
+
 def _write(path: Path, data) -> None:
     path.write_text(json.dumps(data, separators=(",", ":")), encoding="utf-8")
 
@@ -86,12 +96,21 @@ def _write(path: Path, data) -> None:
 def _offers(game: list[dict]) -> tuple[list[dict], set[int]]:
     offers, seen, used = [], set(), set()
     for i, e in enumerate(game):
-        if e["method"] == "GET" and OFFERS_PATH.search(e["path"].split("?", 1)[0]):
-            used.add(i)
-            for o in _body(e).get("offers", []):
-                if o["offerId"] not in seen:
-                    seen.add(o["offerId"])
-                    offers.append(o)
+        if e.get("method") != "GET" or not OFFERS_PATH.fullmatch(e.get("path", "").split("?", 1)[0]) \
+                or not _successful(e):
+            continue
+        try:
+            body = _body(e)
+        except (KeyError, TypeError, ValueError):
+            continue
+        rows = body.get("offers") if isinstance(body, dict) else None
+        if not isinstance(rows, list):
+            continue
+        used.add(i)
+        for o in rows:
+            if isinstance(o, dict) and "offerId" in o and o["offerId"] not in seen:
+                seen.add(o["offerId"])
+                offers.append(o)
     return offers, used
 
 
@@ -99,9 +118,19 @@ def _actions(game: list[dict]) -> tuple[list[dict], set[int]]:
     """Ubisoft Club action definitions, without whose they are and how far that player got."""
     by_id, used = {}, set()
     for i, e in enumerate(game):
-        if e["method"] == "GET" and ACTIONS_PATH.search(e["path"].split("?", 1)[0]):
-            used.add(i)
-            for a in _body(e).get("actions", []):
+        if e.get("method") != "GET" or not ACTIONS_PATH.fullmatch(e.get("path", "").split("?", 1)[0]) \
+                or not _successful(e):
+            continue
+        try:
+            body = _body(e)
+        except (KeyError, TypeError, ValueError):
+            continue
+        rows = body.get("actions") if isinstance(body, dict) else None
+        if not isinstance(rows, list):
+            continue
+        used.add(i)
+        for a in rows:
+            if isinstance(a, dict) and "id" in a:
                 by_id.setdefault(a["id"], {k: v for k, v in a.items() if k not in ACTION_PLAYER_FIELDS})
     return list(by_id.values()), used
 
@@ -112,15 +141,24 @@ def _products(demux: dict) -> list[bytes]:
     replies = demux.get("services", {}).get("ownership_service", {}).get("2", [])
     if not replies:
         return []
-    reply = base64.b64decode(replies[0])
-    init = pb.decode(pb.first(pb.decode(pb.first(pb.decode(reply), 1)), 2))
-    entries = [v for n, v, _ in pb.decode(pb.first(init, 2))]
-    decoded = {pb.first(pb.decode(v), 1): v for v in entries}
-    wanted = set(STEEP_PRODUCTS)
-    for pid in STEEP_PRODUCTS:
-        if pid in decoded:
-            wanted.update(v for n, v, _ in pb.decode(decoded[pid]) if n == 16)
-    return [decoded[p] for p in sorted(wanted) if p in decoded]
+    # Captures merge oldest -> newest. Prefer the current reply, but tolerate a
+    # truncated final recording by falling back to the preceding valid one.
+    for encoded in reversed(replies):
+        try:
+            reply = base64.b64decode(encoded)
+            init = pb.decode(pb.first(pb.decode(pb.first(pb.decode(reply), 1)), 2))
+            entries = [v for n, v, _ in pb.decode(pb.first(init, 2))]
+            decoded = {pb.first(pb.decode(v), 1): v for v in entries}
+            wanted = set(STEEP_PRODUCTS)
+            for pid in STEEP_PRODUCTS:
+                if pid in decoded:
+                    wanted.update(v for n, v, _ in pb.decode(decoded[pid]) if n == 16)
+            products = [decoded[p] for p in sorted(wanted) if p in decoded]
+        except (TypeError, ValueError, pb.DecodeError):
+            continue
+        if products:
+            return products
+    return []
 
 
 def build(recordings: Path, out: Path) -> Report:
@@ -138,12 +176,14 @@ def build(recordings: Path, out: Path) -> Report:
 
     offers, offer_idx = _offers(game)
     actions, action_idx = _actions(game)
-    game_kept = {i for i, e in enumerate(game) if _allowed(GAME_ALLOW, e["method"], e["path"])}
+    game_kept = {i for i, e in enumerate(game)
+                 if _successful(e) and _allowed(GAME_ALLOW, e["method"], e["path"])}
     _write(tmp / "http.json", [game[i] for i in sorted(game_kept)])
     _write(tmp / "offers.json", {"offers": offers})
     _write(tmp / "actions.json", {"actions": actions})
     _write(tmp / "rmc.json", {m: rows for m, rows in rmc.items() if m in RMC_ALLOW})
-    connect_kept = {i for i, e in enumerate(connect) if _allowed(CONNECT_ALLOW, e["method"], e["path"])}
+    connect_kept = {i for i, e in enumerate(connect)
+                    if _successful(e) and _allowed(CONNECT_ALLOW, e["method"], e["path"])}
     _write(tmp / "connect" / "http.json", [connect[i] for i in sorted(connect_kept)])
     products = _products(demux)
     _write(tmp / "connect" / "demux.json", {
