@@ -14,11 +14,13 @@ HOST = "public-ubiservices.ubi.com"
 PLAYER = "00000000-0000-4000-8000-000000000001"
 
 
-def test_windows_runner_disables_http3_for_chromium_user_ca():
+def test_windows_runner_avoids_unproxyable_connect_transports():
     runner = Path(__file__).parents[1] / "tools" / "capture" / "capture.ps1"
     script = runner.read_text(encoding="utf-8")
     assert '"--set", "http3=false"' in script
     assert '"--allow-hosts", (Quote-ProcessArgument $allowedHostsPattern)' in script
+    assert '$CaptureHosts = @($RedirectHosts | Where-Object { $_ -ne $DemuxHost })' in script
+    assert '"--tcp-hosts"' not in script
 
 
 def _body(value):

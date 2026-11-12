@@ -12,6 +12,7 @@ $ErrorActionPreference = "Stop"
 $CaptureDirName = ".powder-capture-mitmproxy"
 $StateFileName = ".powder-capture-state.json"
 $MitmproxyVersion = "12.3.1"
+$DemuxHost = "dmx.upc.ubisoft.com"
 $TargetProcessNames = @(
     "Steep.exe",
     "upc.exe",
@@ -320,10 +321,12 @@ try {
     Write-State $statePath $state
 
     $mode = "local:" + ($TargetProcessNames -join ",")
-    $allowedHostsPattern = "^(?:" + (($RedirectHosts | ForEach-Object {
+    # The official demux edge closes a new TLS connection made by mitmproxy.
+    # Passing it through keeps Connect online; demux is optional for the pack.
+    $CaptureHosts = @($RedirectHosts | Where-Object { $_ -ne $DemuxHost })
+    $allowedHostsPattern = "^(?:" + (($CaptureHosts | ForEach-Object {
         [regex]::Escape($_)
     }) -join "|") + ")(?::\d+)?$"
-    $tcpHosts = '(^|\.)dmx\.upc\.ubisoft\.com(?::443)?$'
     $mitmArguments = @(
         "--from", "mitmproxy==$MitmproxyVersion",
         "mitmdump",
@@ -331,7 +334,6 @@ try {
         # The addon filters persistence, while allow-hosts limits interception
         # itself. Unrelated Connect traffic is passed through untouched.
         "--allow-hosts", (Quote-ProcessArgument $allowedHostsPattern),
-        "--tcp-hosts", (Quote-ProcessArgument $tcpHosts),
         "-s", (Quote-ProcessArgument $addonPath),
         "--set", (Quote-ProcessArgument "powder_recordings=$recordingsRoot"),
         "--set", (Quote-ProcessArgument "confdir=$confDir"),

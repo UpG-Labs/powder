@@ -13,7 +13,7 @@ to redistribute it.
 `capture.ps1` runs mitmproxy 12.3.1 in **local capture** mode. On Windows, local capture redirects the
 selected processes at the networking layer, so it works even though Steep and Ubisoft Connect ignore
 ordinary WinINet, `HTTP_PROXY`, or explicit-proxy settings. Earlier explicit-proxy/Wine experiments are
-not a substitute for this workflow. Interception is restricted to Powder's eight required Ubisoft hosts;
+not a substitute for this workflow. Interception is restricted to Powder's seven pack-relevant HTTP hosts;
 unrelated traffic from those processes passes through untouched. For the captured hosts, the runner
 disables HTTP/3/QUIC: Chromium-based Ubisoft Connect does not trust a user-installed capture CA for QUIC,
 so mitmproxy drops those handshakes and Connect falls back to capturable HTTP/2 or HTTP/1 over TCP.
@@ -21,14 +21,14 @@ so mitmproxy drops those handshakes and Connect falls back to capturable HTTP/2 
 The runner:
 
 1. Refuses to start while Steep/Ubisoft Connect are open or Powder's hosts-file redirect is present.
-2. Starts mitmproxy for only Steep and Ubisoft Connect process names and intercepts only Powder's required
-   Ubisoft hosts. Windows may request elevation for mitmproxy's packet redirector.
+2. Starts mitmproxy for only Steep and Ubisoft Connect process names and intercepts only the seven HTTP
+   hosts used as pack sources. Windows may request elevation for mitmproxy's packet redirector.
 3. Creates an isolated mitmproxy CA under the selected recordings directory, installs that exact CA in
    the current user's trusted roots, and starts Powder's existing Steep TLS helper. The helper is needed
    because Steep TU7 uses pinned, statically linked OpenSSL.
-4. Records decoded HTTP replies without request headers and, when available, parses Ubisoft Connect's
-   TLS demux stream. For progress import only, it also pairs the JSON body of Steep inventory-update
-   POSTs with their replies; it does not retain other request bodies.
+4. Records decoded HTTP replies without request headers. For progress import only, it also pairs the JSON
+   body of Steep inventory-update POSTs with their replies; it does not retain other request bodies.
+   Connect's proprietary demux TLS host is passed through untouched so that Connect remains online.
 5. On exit, stops only the two child processes it started, removes the exact capture CA by thumbprint,
    and deletes the isolated CA private key. It leaves the recordings in place.
 
@@ -146,8 +146,11 @@ disabling certificate validation: QUIC is not needed for the recording, and the 
 
 - `fixtures.json` and `connect-fixtures.json` are the pack's important HTTP sources. The tool keeps all
   relevant Ubisoft response bodies locally so Powder's privacy checker can derive personal markers.
-- Ubisoft Connect demux capture is best effort. It supplies exact owned-product/add-on metadata when the
-  client opens those services. Powder has built-in Steep product entries when it is absent.
+- Ubisoft Connect's `dmx.upc.ubisoft.com` connection is deliberately passed through, not recorded. Its
+  official edge closes the replacement upstream TLS connection made by mitmproxy, which makes Connect and
+  Steep report offline. Demux would only supply exact owned-product/add-on metadata; Powder's built-in
+  Steep product entries are used instead. The corresponding ownership warning in `capture-report.json` is
+  expected and does not block pack construction.
 - The tool does not record NEX/PRUDP. That channel uses ephemeral P-256 ECDH and AES-CBC, so a packet capture
   cannot be converted into decrypted RMC fixtures. This does not block the current pack: Powder now
   generates both pack-allowed RMC methods (`GetGameParamaters` and `FetchSeasonInfo`) itself.
