@@ -320,15 +320,26 @@ try {
     Write-State $statePath $state
 
     $mode = "local:" + ($TargetProcessNames -join ",")
+    $allowedHostsPattern = "^(?:" + (($RedirectHosts | ForEach-Object {
+        [regex]::Escape($_)
+    }) -join "|") + ")(?::\d+)?$"
     $tcpHosts = '(^|\.)dmx\.upc\.ubisoft\.com(?::443)?$'
     $mitmArguments = @(
         "--from", "mitmproxy==$MitmproxyVersion",
         "mitmdump",
         "--mode", (Quote-ProcessArgument $mode),
+        # The addon filters persistence, while allow-hosts limits interception
+        # itself. Unrelated Connect traffic is passed through untouched.
+        "--allow-hosts", (Quote-ProcessArgument $allowedHostsPattern),
         "--tcp-hosts", (Quote-ProcessArgument $tcpHosts),
         "-s", (Quote-ProcessArgument $addonPath),
         "--set", (Quote-ProcessArgument "powder_recordings=$recordingsRoot"),
         "--set", (Quote-ProcessArgument "confdir=$confDir"),
+        # Ubisoft Connect is Chromium-based. Chromium does not trust a
+        # user-installed capture CA for QUIC, but it does for TCP/TLS. Have
+        # mitmproxy drop QUIC handshakes so Connect falls back to HTTP/2 or
+        # HTTP/1 over TCP, which remains fully captured.
+        "--set", "http3=false",
         "--set", "flow_detail=0"
     )
     $mitmProcess = Start-Process -FilePath $uvx.Source -ArgumentList $mitmArguments -WorkingDirectory $repoRoot `

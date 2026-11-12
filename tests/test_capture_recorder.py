@@ -1,5 +1,6 @@
 import base64
 import json
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +12,13 @@ from tools.capture.recorder import RecordingStore, classify_http
 
 HOST = "public-ubiservices.ubi.com"
 PLAYER = "00000000-0000-4000-8000-000000000001"
+
+
+def test_windows_runner_disables_http3_for_chromium_user_ca():
+    runner = Path(__file__).parents[1] / "tools" / "capture" / "capture.ps1"
+    script = runner.read_text(encoding="utf-8")
+    assert '"--set", "http3=false"' in script
+    assert '"--allow-hosts", (Quote-ProcessArgument $allowedHostsPattern)' in script
 
 
 def _body(value):

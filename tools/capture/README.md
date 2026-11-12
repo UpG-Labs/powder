@@ -13,13 +13,16 @@ to redistribute it.
 `capture.ps1` runs mitmproxy 12.3.1 in **local capture** mode. On Windows, local capture redirects the
 selected processes at the networking layer, so it works even though Steep and Ubisoft Connect ignore
 ordinary WinINet, `HTTP_PROXY`, or explicit-proxy settings. Earlier explicit-proxy/Wine experiments are
-not a substitute for this workflow.
+not a substitute for this workflow. Interception is restricted to Powder's eight required Ubisoft hosts;
+unrelated traffic from those processes passes through untouched. For the captured hosts, the runner
+disables HTTP/3/QUIC: Chromium-based Ubisoft Connect does not trust a user-installed capture CA for QUIC,
+so mitmproxy drops those handshakes and Connect falls back to capturable HTTP/2 or HTTP/1 over TCP.
 
 The runner:
 
 1. Refuses to start while Steep/Ubisoft Connect are open or Powder's hosts-file redirect is present.
-2. Starts mitmproxy for only Steep and Ubisoft Connect process names. Windows may request elevation for
-   mitmproxy's packet redirector.
+2. Starts mitmproxy for only Steep and Ubisoft Connect process names and intercepts only Powder's required
+   Ubisoft hosts. Windows may request elevation for mitmproxy's packet redirector.
 3. Creates an isolated mitmproxy CA under the selected recordings directory, installs that exact CA in
    the current user's trusted roots, and starts Powder's existing Steep TLS helper. The helper is needed
    because Steep TU7 uses pinned, statically linked OpenSSL.
@@ -134,6 +137,10 @@ replays the crash journal into the canonical JSON files, removes only the record
 deletes only the `.powder-capture-mitmproxy` subdirectory. It does not delete recordings. If a child cannot
 be verified/stopped or certificate removal fails, the state and CA directory are retained so the operation
 can be retried.
+
+If the capture console reports `Client QUIC handshake failed` with `CERTIFICATE_VERIFY_FAILED`, verify that
+the runner contains the `http3=false` option and update the capture-tool branch. Do not work around this by
+disabling certificate validation: QUIC is not needed for the recording, and the TCP fallback is safer.
 
 ## Protocol limitations
 
