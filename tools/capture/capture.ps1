@@ -3,6 +3,8 @@ param(
     [Parameter(Position = 0)]
     [string] $Recordings,
 
+    [switch] $CaptureConnectUi,
+
     [switch] $Cleanup
 )
 
@@ -13,7 +15,12 @@ $CaptureDirName = ".powder-capture-mitmproxy"
 $StateFileName = ".powder-capture-state.json"
 $MitmproxyVersion = "12.3.1"
 $DemuxHost = "dmx.upc.ubisoft.com"
-$TargetProcessNames = @(
+$CaptureProcessNames = @("Steep.exe")
+$ConnectUiProcessNames = @(
+    "UplayWebCore.exe",
+    "UbisoftConnectWebCore.exe"
+)
+$StoppedProcessNames = @(
     "Steep.exe",
     "upc.exe",
     "UbisoftConnect.exe",
@@ -212,7 +219,7 @@ function Assert-NoRedirectedHosts {
 }
 
 function Assert-TargetProcessesStopped {
-    $baseNames = $TargetProcessNames | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_) }
+    $baseNames = $StoppedProcessNames | ForEach-Object { [IO.Path]::GetFileNameWithoutExtension($_) }
     $running = Get-Process -ErrorAction SilentlyContinue |
         Where-Object { $baseNames -contains $_.ProcessName } |
         Select-Object -ExpandProperty ProcessName -Unique
@@ -320,9 +327,15 @@ try {
     New-Item -ItemType Directory -Path $confDir -Force | Out-Null
     Write-State $statePath $state
 
-    $mode = "local:" + ($TargetProcessNames -join ",")
-    # The official demux edge closes a new TLS connection made by mitmproxy.
-    # Passing it through keeps Connect online; demux is optional for the pack.
+    # Local-mode host exclusions still traverse mitmproxy's user-space TCP relay. Keep Connect's
+    # login/session processes outside the redirector entirely; an optional second pass captures
+    # only its Chromium UI processes for achievement/configuration assets.
+    if ($CaptureConnectUi) {
+        $CaptureProcessNames += $ConnectUiProcessNames
+    }
+    $mode = "local:" + ($CaptureProcessNames -join ",")
+    # Never intercept demux if a selected game/UI process opens it. Connect's core processes are
+    # excluded from local mode above, which is the actual native-network bypass.
     $CaptureHosts = @($RedirectHosts | Where-Object { $_ -ne $DemuxHost })
     $allowedHostsPattern = "^(?:" + (($CaptureHosts | ForEach-Object {
         [regex]::Escape($_)
@@ -331,8 +344,8 @@ try {
         "--from", "mitmproxy==$MitmproxyVersion",
         "mitmdump",
         "--mode", (Quote-ProcessArgument $mode),
-        # The addon filters persistence, while allow-hosts limits interception
-        # itself. Unrelated Connect traffic is passed through untouched.
+        # The addon filters persistence, while allow-hosts limits TLS interception itself.
+        # Nonmatching traffic is relayed without decryption.
         "--allow-hosts", (Quote-ProcessArgument $allowedHostsPattern),
         "-s", (Quote-ProcessArgument $addonPath),
         "--set", (Quote-ProcessArgument "powder_recordings=$recordingsRoot"),
@@ -385,6 +398,7 @@ try {
 
     Write-Host ""
     Write-Host "Recorder ready." -ForegroundColor Green
+    Write-Host "Redirected processes: $($CaptureProcessNames -join ', ')"
     Write-Host "Start Ubisoft Connect normally, sign in to your legitimate account, and launch Steep."
     Write-Host "Follow the capture checklist in tools\capture\README.md."
     Write-Host "When finished, close Steep and press Ctrl+C in this window."

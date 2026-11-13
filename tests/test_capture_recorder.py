@@ -20,6 +20,10 @@ def test_windows_runner_avoids_unproxyable_connect_transports():
     assert '"--set", "http3=false"' in script
     assert '"--allow-hosts", (Quote-ProcessArgument $allowedHostsPattern)' in script
     assert '$CaptureHosts = @($RedirectHosts | Where-Object { $_ -ne $DemuxHost })' in script
+    assert '$CaptureProcessNames = @("Steep.exe")' in script
+    assert '$CaptureProcessNames += $ConnectUiProcessNames' in script
+    assert '$mode = "local:" + ($CaptureProcessNames -join ",")' in script
+    assert '$mode = "local:" + ($StoppedProcessNames -join ",")' not in script
     assert '"--tcp-hosts"' not in script
 
 

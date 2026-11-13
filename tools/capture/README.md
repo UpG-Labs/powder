@@ -11,24 +11,23 @@ to redistribute it.
 ## What the tool does
 
 `capture.ps1` runs mitmproxy 12.3.1 in **local capture** mode. On Windows, local capture redirects the
-selected processes at the networking layer, so it works even though Steep and Ubisoft Connect ignore
-ordinary WinINet, `HTTP_PROXY`, or explicit-proxy settings. Earlier explicit-proxy/Wine experiments are
-not a substitute for this workflow. Interception is restricted to Powder's seven pack-relevant HTTP hosts;
-unrelated traffic from those processes passes through untouched. For the captured hosts, the runner
-disables HTTP/3/QUIC: Chromium-based Ubisoft Connect does not trust a user-installed capture CA for QUIC,
-so mitmproxy drops those handshakes and Connect falls back to capturable HTTP/2 or HTTP/1 over TCP.
+selected processes at the networking layer, so it works even though Steep ignores ordinary WinINet,
+`HTTP_PROXY`, or explicit-proxy settings. Earlier explicit-proxy/Wine experiments are not a substitute for
+this workflow. By default only `Steep.exe` is redirected. Ubisoft Connect's login/session processes remain
+entirely outside mitmproxy so that its proprietary connections use native sockets. Interception within the
+game process is restricted to Powder's pack-relevant HTTP hosts; unrelated traffic is relayed without TLS
+interception.
 
 The runner:
 
 1. Refuses to start while Steep/Ubisoft Connect are open or Powder's hosts-file redirect is present.
-2. Starts mitmproxy for only Steep and Ubisoft Connect process names and intercepts only the seven HTTP
-   hosts used as pack sources. Windows may request elevation for mitmproxy's packet redirector.
+2. Starts mitmproxy for `Steep.exe` and intercepts only the HTTP hosts used as game pack sources. Windows
+   may request elevation for mitmproxy's packet redirector. Connect remains outside the redirector.
 3. Creates an isolated mitmproxy CA under the selected recordings directory, installs that exact CA in
    the current user's trusted roots, and starts Powder's existing Steep TLS helper. The helper is needed
    because Steep TU7 uses pinned, statically linked OpenSSL.
 4. Records decoded HTTP replies without request headers. For progress import only, it also pairs the JSON
    body of Steep inventory-update POSTs with their replies; it does not retain other request bodies.
-   Connect's proprietary demux TLS host is passed through untouched so that Connect remains online.
 5. On exit, stops only the two child processes it started, removes the exact capture CA by thumbprint,
    and deletes the isolated CA private key. It leaves the recordings in place.
 
@@ -81,12 +80,25 @@ the script prints **Recorder ready**. The TLS watcher waits up to 15 minutes for
 4. Open the in-game Store. Visit every sport, equipment, clothing, DLC, and reward category, and scroll
    each list to the end. Offer data is paged: seeing the first screen is not enough.
 5. Open Ubisoft Club/Connect actions and rewards from the game where available.
-6. Open the Ubisoft Connect overlay with Shift+F2, select Steep, open Achievements, and wait for names and
-   icons to load. Also open the Steep game/details and owned-DLC views.
-7. Return to the game for a minute so delayed configuration requests complete, then close Steep and
+6. Return to the game for a minute so delayed configuration requests complete, then close Steep and
    Ubisoft Connect.
-8. Press Ctrl+C in the capture console. Wait for confirmation that the temporary CA and private key were
+7. Press Ctrl+C in the capture console. Wait for confirmation that the temporary CA and private key were
    removed.
+
+The default pass deliberately does not capture Connect itself. This is sufficient to build the core pack,
+but `capture-report.json` will warn that achievement definitions and exact Connect product metadata are
+absent. Powder can use its built-in Steep product entries. To attempt the optional achievement/configuration
+capture, run a second pass against the same recordings directory:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\capture\capture.ps1 -Recordings .\recordings -CaptureConnectUi
+```
+
+This adds only Connect's Chromium WebCore processes to local capture. Its core login/session executables
+remain outside mitmproxy. During this optional pass, open the Connect overlay with Shift+F2, select Steep,
+open Achievements, and wait for the names and icons to load. Also open Steep's game/details and owned-DLC
+views. If the optional pass makes the Connect UI report offline, stop it and keep the default-pass data;
+the optional warnings do not prevent a pack build.
 
 The recorder is resumable: running it again with the same recordings directory merges exact new replies
 and preserves distinct response bodies. Read `recordings/capture-report.json` after every pass. In
@@ -144,11 +156,12 @@ disabling certificate validation: QUIC is not needed for the recording, and the 
 
 ## Protocol limitations
 
-- `fixtures.json` and `connect-fixtures.json` are the pack's important HTTP sources. The tool keeps all
-  relevant Ubisoft response bodies locally so Powder's privacy checker can derive personal markers.
-- Ubisoft Connect's `dmx.upc.ubisoft.com` connection is deliberately passed through, not recorded. Its
-  official edge closes the replacement upstream TLS connection made by mitmproxy, which makes Connect and
-  Steep report offline. Demux would only supply exact owned-product/add-on metadata; Powder's built-in
+- `fixtures.json` is the core pack's HTTP source. An optional WebCore pass adds Connect configuration and
+  achievement definitions to `connect-fixtures.json`. The tool keeps relevant Ubisoft response bodies
+  locally so Powder's privacy checker can derive personal markers.
+- Ubisoft Connect's core processes, including their `dmx.upc.ubisoft.com` connection, are deliberately
+  excluded from local capture. Mitmproxy host exclusions still use a user-space relay and therefore are not
+  a native network bypass. Demux would only supply exact owned-product/add-on metadata; Powder's built-in
   Steep product entries are used instead. The corresponding ownership warning in `capture-report.json` is
   expected and does not block pack construction.
 - The tool does not record NEX/PRUDP. That channel uses ephemeral P-256 ECDH and AES-CBC, so a packet capture
