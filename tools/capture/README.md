@@ -85,6 +85,10 @@ the script prints **Recorder ready**. The TLS watcher waits up to 15 minutes for
 7. Press Ctrl+C in the capture console. Wait for confirmation that the temporary CA and private key were
    removed.
 
+The console prints a privacy-safe progress line whenever a new HTTP fixture is saved. It shows only the
+game/Connect classification, HTTP status, and aggregate counts; it never prints URLs, query strings,
+headers, account IDs, or response contents. Normal mitmproxy flow output remains hidden.
+
 The default pass deliberately does not capture Connect itself. This is sufficient to build the core pack,
 but `capture-report.json` will warn that achievement definitions and exact Connect product metadata are
 absent. Powder can use its built-in Steep product entries. To attempt the optional achievement/configuration
@@ -143,6 +147,10 @@ temporary CA installed. Rerun the exact command with `-Cleanup` and the same rec
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\capture\capture.ps1 -Recordings .\recordings -Cleanup
 ```
+
+Use that recovery command after updating if an older runner stopped with a `taskkill.exe` or
+`NativeCommandError`. Do not delete the recordings directory first: each accepted response is flushed to
+`capture-journal.jsonl`, and cleanup replays that journal into the canonical JSON files and report.
 
 Cleanup reads `.powder-capture-state.json`, verifies recorded process start times before stopping anything,
 replays the crash journal into the canonical JSON files, removes only the recorded CA thumbprint, and

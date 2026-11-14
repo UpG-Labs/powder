@@ -13,6 +13,7 @@ $ErrorActionPreference = "Stop"
 
 $CaptureDirName = ".powder-capture-mitmproxy"
 $StateFileName = ".powder-capture-state.json"
+$ShutdownFileName = "shutdown.request"
 $MitmproxyVersion = "12.3.1"
 $DemuxHost = "dmx.upc.ubisoft.com"
 $CaptureProcessNames = @("Steep.exe")
@@ -73,7 +74,7 @@ function Invoke-RecorderFinalizer([string] $UvPath, [string] $Repository, [strin
     }
 }
 
-function Stop-RecordedProcess($Record, [string] $Label) {
+function Stop-RecordedProcess($Record, [string] $Label, [int] $GraceMilliseconds = 3000) {
     if ($null -eq $Record -or $null -eq $Record.pid) {
         return $true
     }
@@ -96,16 +97,40 @@ function Stop-RecordedProcess($Record, [string] $Label) {
     Write-Host "Stopping $Label (PID $($Record.pid))..."
     # Ctrl+C is delivered to processes sharing this console. Give mitmproxy time to run addon.done()
     # and atomically finalize its report before using the forced process-tree fallback.
-    if ($process.WaitForExit(3000)) {
+    if ($process.WaitForExit($GraceMilliseconds)) {
         return $true
     }
     # uv/uvx wait on the actual Python process. /T stops that exact verified process tree as well.
-    & taskkill.exe /PID $processId /T /F 2>$null | Out-Host
+    # Native stderr becomes a terminating PowerShell error under ErrorActionPreference=Stop. Preserve
+    # finalization even if taskkill races an exiting child or cannot terminate an elevated descendant.
+    $taskkillSucceeded = $true
+    try {
+        & taskkill.exe /PID $processId /T /F 2>$null | Out-Host
+        $taskkillSucceeded = $LASTEXITCODE -eq 0
+    }
+    catch {
+        $taskkillSucceeded = $false
+        Write-Verbose "taskkill could not complete for $Label PID $processId; checking the process directly."
+    }
     if (Get-Process -Id $processId -ErrorAction SilentlyContinue) {
         Stop-Process -Id $processId -Force -ErrorAction SilentlyContinue
     }
     Start-Sleep -Milliseconds 250
-    return $null -eq (Get-Process -Id $processId -ErrorAction SilentlyContinue)
+    $rootStopped = $null -eq (Get-Process -Id $processId -ErrorAction SilentlyContinue)
+    # A failed tree kill may have left an elevated descendant behind even when uvx itself exited.
+    # Retain the CA/state and let a later -Cleanup verify the now-settled process tree.
+    return $taskkillSucceeded -and $rootStopped
+}
+
+function Request-MitmdumpShutdown([string] $Path) {
+    try {
+        [IO.File]::WriteAllText($Path, "shutdown")
+        return $true
+    }
+    catch {
+        Write-Warning "Could not request a graceful mitmproxy shutdown; the process fallback will be used: $_"
+        return $false
+    }
 }
 
 function Get-CertificateThumbprint([string] $CertificatePath) {
@@ -153,7 +178,8 @@ function Invoke-RecoveryCleanup([string] $StatePath, [string] $ConfDir, [string]
     if (Test-Path -LiteralPath $StatePath -PathType Leaf) {
         $state = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
         $attachStopped = Stop-RecordedProcess $state.attach "Steep TLS-helper watcher"
-        $mitmStopped = Stop-RecordedProcess $state.mitmproxy "mitmproxy"
+        $null = Request-MitmdumpShutdown (Join-Path $ConfDir $ShutdownFileName)
+        $mitmStopped = Stop-RecordedProcess $state.mitmproxy "mitmproxy" 15000
         if (-not $attachStopped -or -not $mitmStopped) {
             Write-Warning "A recorded capture process could not be stopped safely; CA/key state was retained."
             return $false
@@ -250,6 +276,7 @@ $confDir = Join-Path $recordingsRoot $CaptureDirName
 $statePath = Join-Path $recordingsRoot $StateFileName
 $caCertificate = Join-Path $confDir "mitmproxy-ca-cert.cer"
 $recorderJournal = Join-Path $recordingsRoot "capture-journal.jsonl"
+$shutdownFile = Join-Path $confDir $ShutdownFileName
 
 if ($Cleanup) {
     if (Invoke-RecoveryCleanup $statePath $confDir $recordingsRoot) {
@@ -350,6 +377,7 @@ try {
         "-s", (Quote-ProcessArgument $addonPath),
         "--set", (Quote-ProcessArgument "powder_recordings=$recordingsRoot"),
         "--set", (Quote-ProcessArgument "confdir=$confDir"),
+        "--set", (Quote-ProcessArgument "powder_shutdown_file=$shutdownFile"),
         # Ubisoft Connect is Chromium-based. Chromium does not trust a
         # user-installed capture CA for QUIC, but it does for TCP/TLS. Have
         # mitmproxy drop QUIC handshakes so Connect falls back to HTTP/2 or
@@ -432,7 +460,8 @@ finally {
         $childrenStopped = (Stop-RecordedProcess $state.attach "Steep TLS-helper watcher") -and $childrenStopped
     }
     if ($null -ne $state.mitmproxy) {
-        $childrenStopped = (Stop-RecordedProcess $state.mitmproxy "mitmproxy") -and $childrenStopped
+        $null = Request-MitmdumpShutdown $shutdownFile
+        $childrenStopped = (Stop-RecordedProcess $state.mitmproxy "mitmproxy" 15000) -and $childrenStopped
     }
 
     if ($childrenStopped) {

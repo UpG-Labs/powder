@@ -27,6 +27,25 @@ def test_windows_runner_avoids_unproxyable_connect_transports():
     assert '"--tcp-hosts"' not in script
 
 
+def test_windows_runner_does_not_abort_cleanup_on_taskkill_race():
+    runner = Path(__file__).parents[1] / "tools" / "capture" / "capture.ps1"
+    script = runner.read_text(encoding="utf-8")
+    assert "try {\n        & taskkill.exe /PID $processId /T /F" in script
+    assert 'catch {\n        $taskkillSucceeded = $false' in script
+    assert "return $taskkillSucceeded -and $rootStopped" in script
+
+
+def test_windows_runner_requests_graceful_mitmdump_shutdown():
+    root = Path(__file__).parents[1]
+    runner = (root / "tools" / "capture" / "capture.ps1").read_text(encoding="utf-8")
+    addon = (root / "tools" / "capture" / "addon.py").read_text(encoding="utf-8")
+    assert '"powder_shutdown_file=$shutdownFile"' in runner
+    assert runner.count("Request-MitmdumpShutdown") >= 3  # definition, recovery, ordinary shutdown
+    assert 'Stop-RecordedProcess $state.mitmproxy "mitmproxy" 15000' in runner
+    assert '"powder_shutdown_file"' in addon
+    assert "ctx.master.shutdown()" in addon
+
+
 def _body(value):
     return json.dumps(value).encode()
 
@@ -84,6 +103,21 @@ def test_http_recording_inventory_resume_and_completeness(tmp_path):
     build_report = build(root, pack)
     assert not build_report.findings
     assert (pack / "MANIFEST.json").is_file()
+
+
+def test_http_recording_reports_only_new_fixtures_across_resume(tmp_path):
+    root = tmp_path / "recordings"
+    store = RecordingStore(root)
+    args = ("GET", HOST, "/private/profile/path?ticket=secret", 200, "application/json", b"{}")
+    assert store.record_http(*args, target="game")
+    assert not store.record_http(*args, target="game")
+    store.close()
+
+    resumed = RecordingStore(root)
+    assert not resumed.record_http(*args, target="game")
+    assert resumed.record_http(*args, target="connect")
+    assert not resumed.record_http(*args, target="both")
+    resumed.close()
 
 
 def test_demux_chunk_reassembly_channel_correlation_and_service_reply(tmp_path):

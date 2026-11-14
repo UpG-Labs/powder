@@ -218,10 +218,10 @@ class RecordingStore:
             os.replace(tmp, self.journal_path)
             _private(self.journal_path)
 
-    def _event(self, kind: str, value) -> None:
+    def _event(self, kind: str, value) -> bool:
         event = {"kind": kind, "value": value}
         if not self._would_change(event):
-            return
+            return False
         self._journal.write(_stable(event) + "\n")
         self._journal.flush()
         os.fsync(self._journal.fileno())
@@ -232,6 +232,7 @@ class RecordingStore:
         # intercepted game, so checkpoint them periodically and at close.
         if self._dirty_events >= CHECKPOINT_EVENTS:
             self.flush()
+        return True
 
     def _would_change(self, event: dict) -> bool:
         kind, value = event.get("kind"), event.get("value")
@@ -316,14 +317,15 @@ class RecordingStore:
 
     def record_http(self, method: str, host: str, path: str, status: int, content_type: str,
                     body: bytes, *, request_body: bytes | None = None,
-                    timestamp: float | None = None, target: str = "both") -> None:
+                    timestamp: float | None = None, target: str = "both") -> bool:
         """Record one decoded HTTP response; no request headers are accepted or stored.
 
         ``target`` is ``game``, ``connect``, or ``both``.  The network adapter
         derives it from the non-secret Ubi-AppId header and endpoint shape, then
         discards the header.  Keeping the two fixture sets separate matters:
         copying an allow-listed game reply into Connect's unkept marker pool can
-        create a false privacy finding.
+        create a false privacy finding. Returns whether this response added a
+        fixture, so adapters can report progress without exposing its URL.
         """
         if target not in ("game", "connect", "both"):
             raise ValueError("target must be 'game', 'connect', or 'both'")
@@ -332,8 +334,9 @@ class RecordingStore:
                  "content_type": (content_type or "application/octet-stream").split(";", 1)[0].strip(),
                  "body_b64": base64.b64encode(body).decode("ascii")}
         targets = ("game", "connect") if target == "both" else (target,)
+        added = False
         for selected in targets:
-            self._event(f"http_{selected}", entry)
+            added = self._event(f"http_{selected}", entry) or added
 
         match = INVENTORY_PATH.fullmatch(path.split("?", 1)[0])
         request, reply = _json_bytes(request_body or b""), _json_bytes(body)
@@ -341,6 +344,7 @@ class RecordingStore:
             update = {"time": float(timestamp if timestamp is not None else time.time()),
                       "profileId": match.group(1), "request": request, "reply": reply}
             self._event("inventory", update)
+        return added
 
     def record_issue(self, code: str, method: str, host: str, path: str, detail: str) -> None:
         """Persist a non-secret reason why a response could not be recorded."""

@@ -10,6 +10,7 @@ flow and :class:`RecordingStore` reconstructs its frames across arbitrary chunks
 """
 from __future__ import annotations
 
+import asyncio
 import re
 import sys
 from pathlib import Path
@@ -28,6 +29,7 @@ from tools.capture.recorder import RecordingStore, classify_http
 DEFAULT_MAX_BODY = 32 * 1024 * 1024
 HTTP_HOSTS = frozenset(h.lower() for h in REDIRECT_HOSTS if h != DEMUX_HOST)
 INVENTORY_UPDATE = re.compile(r"^/v1/profiles/[^/?]+/inventory(?:\?|$)")
+SHUTDOWN_POLL_SECONDS = 0.2
 
 
 def _host(value: str | None) -> str:
@@ -71,6 +73,7 @@ class PowderCaptureAddon:
     def __init__(self) -> None:
         self.store: RecordingStore | None = None
         self.root: Path | None = None
+        self.shutdown_watcher: asyncio.Task[None] | None = None
 
     def load(self, loader) -> None:
         loader.add_option(
@@ -84,6 +87,12 @@ class PowderCaptureAddon:
             int,
             DEFAULT_MAX_BODY,
             "Largest decoded HTTP response body to retain, in bytes.",
+        )
+        loader.add_option(
+            "powder_shutdown_file",
+            str,
+            "",
+            "Private sentinel path used by capture.ps1 to request a graceful shutdown.",
         )
 
     def configure(self, updated: set[str]) -> None:
@@ -110,6 +119,24 @@ class PowderCaptureAddon:
         # direct addon use robust across mitmproxy lifecycle changes.
         if self.store is None and str(ctx.options.powder_recordings or "").strip():
             self.configure({"powder_recordings"})
+        configured = str(ctx.options.powder_shutdown_file or "").strip()
+        if configured and self.shutdown_watcher is None:
+            sentinel = Path(configured).expanduser().resolve()
+            self.shutdown_watcher = asyncio.create_task(
+                self._watch_for_shutdown(sentinel), name="powder-capture-shutdown"
+            )
+
+    async def _watch_for_shutdown(self, sentinel: Path) -> None:
+        try:
+            while not sentinel.is_file():
+                await asyncio.sleep(SHUTDOWN_POLL_SECONDS)
+        except asyncio.CancelledError:
+            return
+        except OSError as exc:
+            ctx.log.error(f"Powder capture could not watch its shutdown sentinel: {type(exc).__name__}")
+            return
+        ctx.log.info("Powder capture received a graceful shutdown request; finalizing recordings.")
+        ctx.master.shutdown()
 
     def response(self, flow: http.HTTPFlow) -> None:
         store = self.store
@@ -146,7 +173,8 @@ class PowderCaptureAddon:
         content_type = flow.response.headers.get("content-type", "").split(";", 1)[0].strip()
         timestamp = flow.response.timestamp_end or flow.response.timestamp_start
         try:
-            store.record_http(
+            target = _target(flow, host)
+            added = store.record_http(
                 method=flow.request.method.upper(),
                 host=host,
                 path=flow.request.path,
@@ -155,8 +183,16 @@ class PowderCaptureAddon:
                 body=body,
                 request_body=request_body,
                 timestamp=timestamp,
-                target=_target(flow, host),
+                target=target,
             )
+            if added:
+                # Deliberately omit method, host, path, headers, and body. Paths can contain
+                # account IDs and query strings can contain session data.
+                ctx.log.info(
+                    "Powder capture saved a new "
+                    f"{target} HTTP response (status {flow.response.status_code}; "
+                    f"totals: {len(store.game_http)} game, {len(store.connect_http)} Connect)."
+                )
         except Exception as exc:
             # An output-disk failure must be visible, but must not alter the
             # official response being relayed to the game.
@@ -181,6 +217,9 @@ class PowderCaptureAddon:
             self.store.end_demux(str(flow.id))
 
     def done(self) -> None:
+        if self.shutdown_watcher is not None and not self.shutdown_watcher.done():
+            self.shutdown_watcher.cancel()
+        self.shutdown_watcher = None
         if self.store is not None:
             self.store.close()
             self.store = None
