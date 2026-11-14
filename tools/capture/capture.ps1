@@ -14,9 +14,14 @@ $ErrorActionPreference = "Stop"
 $CaptureDirName = ".powder-capture-mitmproxy"
 $StateFileName = ".powder-capture-state.json"
 $ShutdownFileName = "shutdown.request"
+$ReadyFileName = "recorder.ready"
 $MitmproxyVersion = "12.3.1"
 $DemuxHost = "dmx.upc.ubisoft.com"
-$CaptureProcessNames = @("Steep.exe")
+$CaptureProcessNames = @(
+    "Steep.exe",
+    "steep.exe",
+    "STEEP.EXE"
+)
 $ConnectUiProcessNames = @(
     "UplayWebCore.exe",
     "UbisoftConnectWebCore.exe"
@@ -173,31 +178,84 @@ function Remove-CaptureDirectory([string] $Directory, [string] $RecordingsRoot) 
     Remove-Item -LiteralPath $fullDirectory -Recurse -Force
 }
 
+function Get-CanonicalRecoveryPath($Value) {
+    if ($Value -isnot [string] -or [string]::IsNullOrWhiteSpace($Value) -or
+        -not [IO.Path]::IsPathRooted($Value)) {
+        return $null
+    }
+    try {
+        $separators = [char[]]@([IO.Path]::DirectorySeparatorChar, [IO.Path]::AltDirectorySeparatorChar)
+        return [IO.Path]::GetFullPath($Value).TrimEnd($separators)
+    }
+    catch {
+        return $null
+    }
+}
+
 function Invoke-RecoveryCleanup([string] $StatePath, [string] $ConfDir, [string] $RecordingsRoot) {
-    $state = $null
-    if (Test-Path -LiteralPath $StatePath -PathType Leaf) {
+    # Recovery state is stored beside private recordings and can be edited independently of this
+    # script. Bind it to the directory selected on this invocation before trusting a PID or thumbprint.
+    if (-not (Test-Path -LiteralPath $StatePath -PathType Leaf)) {
+        Write-Warning "Capture recovery state is missing; no process, certificate, or file was changed."
+        return $false
+    }
+    try {
         $state = Get-Content -LiteralPath $StatePath -Raw | ConvertFrom-Json
-        $attachStopped = Stop-RecordedProcess $state.attach "Steep TLS-helper watcher"
-        $null = Request-MitmdumpShutdown (Join-Path $ConfDir $ShutdownFileName)
-        $mitmStopped = Stop-RecordedProcess $state.mitmproxy "mitmproxy" 15000
-        if (-not $attachStopped -or -not $mitmStopped) {
-            Write-Warning "A recorded capture process could not be stopped safely; CA/key state was retained."
+    }
+    catch {
+        Write-Warning "Capture recovery state is unreadable; no process, certificate, or file was changed: $_"
+        return $false
+    }
+
+    $requiredStateProperties = @("format", "recordings", "confdir", "ca_thumbprint", "attach", "mitmproxy")
+    foreach ($property in $requiredStateProperties) {
+        if ($null -eq $state -or $null -eq $state.PSObject.Properties[$property]) {
+            Write-Warning "Capture recovery state is missing '$property'; no process, certificate, or file was changed."
             return $false
         }
     }
+    $validFormatType = $state.format -is [int] -or $state.format -is [long]
+    if (-not $validFormatType -or [long] $state.format -ne 1) {
+        Write-Warning "Capture recovery state format is not supported; no process, certificate, or file was changed."
+        return $false
+    }
 
-    $thumbprint = $null
-    if ($null -ne $state -and $null -ne $state.ca_thumbprint) {
-        $thumbprint = [string] $state.ca_thumbprint
+    $selectedRecordings = Get-CanonicalRecoveryPath $RecordingsRoot
+    $selectedConfDir = Get-CanonicalRecoveryPath $ConfDir
+    $recordedRecordings = Get-CanonicalRecoveryPath $state.recordings
+    $recordedConfDir = Get-CanonicalRecoveryPath $state.confdir
+    if ($null -eq $selectedRecordings -or $null -eq $selectedConfDir -or
+        $null -eq $recordedRecordings -or $null -eq $recordedConfDir -or
+        -not $selectedRecordings.Equals($recordedRecordings, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $selectedConfDir.Equals($recordedConfDir, [StringComparison]::OrdinalIgnoreCase)) {
+        Write-Warning "Capture recovery state does not match the selected recordings directory; no process, certificate, or file was changed."
+        return $false
     }
-    if ([string]::IsNullOrWhiteSpace($thumbprint)) {
-        $thumbprint = Get-CertificateThumbprint (Join-Path $ConfDir "mitmproxy-ca-cert.cer")
+
+    $thumbprint = [string] $state.ca_thumbprint
+    if ($thumbprint -notmatch "^[0-9A-Fa-f]{40}$") {
+        Write-Warning "Capture recovery state has no valid CA thumbprint; no process, certificate, or file was changed."
+        return $false
     }
-    $certificateThumbprint = Get-CertificateThumbprint (Join-Path $ConfDir "mitmproxy-ca-cert.cer")
-    if (-not [string]::IsNullOrWhiteSpace($thumbprint) -and
-        -not [string]::IsNullOrWhiteSpace($certificateThumbprint) -and
-        $thumbprint.Replace(" ", "").ToUpperInvariant() -ne $certificateThumbprint) {
-        Write-Warning "Capture state thumbprint does not match its isolated CA file; nothing was removed."
+    $caFile = Join-Path $ConfDir "mitmproxy-ca-cert.cer"
+    try {
+        $certificateThumbprint = Get-CertificateThumbprint $caFile
+    }
+    catch {
+        Write-Warning "The isolated capture CA file is unreadable; no process, certificate, or file was changed: $_"
+        return $false
+    }
+    if ($certificateThumbprint -notmatch "^[0-9A-F]{40}$" -or
+        $thumbprint.ToUpperInvariant() -ne $certificateThumbprint) {
+        Write-Warning "Capture recovery state does not match its isolated CA file; no process, certificate, or file was changed."
+        return $false
+    }
+
+    $attachStopped = Stop-RecordedProcess $state.attach "Steep TLS-helper watcher"
+    $null = Request-MitmdumpShutdown (Join-Path $ConfDir $ShutdownFileName)
+    $mitmStopped = Stop-RecordedProcess $state.mitmproxy "mitmproxy" 15000
+    if (-not $attachStopped -or -not $mitmStopped) {
+        Write-Warning "A recorded capture process could not be stopped safely; CA/key state was retained."
         return $false
     }
 
@@ -275,8 +333,8 @@ New-Item -ItemType Directory -Path $recordingsRoot -Force | Out-Null
 $confDir = Join-Path $recordingsRoot $CaptureDirName
 $statePath = Join-Path $recordingsRoot $StateFileName
 $caCertificate = Join-Path $confDir "mitmproxy-ca-cert.cer"
-$recorderJournal = Join-Path $recordingsRoot "capture-journal.jsonl"
 $shutdownFile = Join-Path $confDir $ShutdownFileName
+$readyFile = Join-Path $confDir $ReadyFileName
 
 if ($Cleanup) {
     if (Invoke-RecoveryCleanup $statePath $confDir $recordingsRoot) {
@@ -354,35 +412,43 @@ try {
     New-Item -ItemType Directory -Path $confDir -Force | Out-Null
     Write-State $statePath $state
 
-    # Local-mode host exclusions still traverse mitmproxy's user-space TCP relay. Keep Connect's
-    # login/session processes outside the redirector entirely; an optional second pass captures
-    # only its Chromium UI processes for achievement/configuration assets.
+    # Keep Connect's login/session processes outside the redirector entirely. The optional second
+    # pass captures only Chromium UI processes for achievement/configuration assets.
     if ($CaptureConnectUi) {
-        $CaptureProcessNames += $ConnectUiProcessNames
+        $CaptureProcessNames = @($ConnectUiProcessNames)
     }
     $mode = "local:" + ($CaptureProcessNames -join ",")
-    # Never intercept demux if a selected game/UI process opens it. Connect's core processes are
-    # excluded from local mode above, which is the actual native-network bypass.
-    $CaptureHosts = @($RedirectHosts | Where-Object { $_ -ne $DemuxHost })
-    $allowedHostsPattern = "^(?:" + (($CaptureHosts | ForEach-Object {
-        [regex]::Escape($_)
-    }) -join "|") + ")(?::\d+)?$"
+    # The official demux edge rejects mitmproxy's replacement upstream TLS connection. Preserve
+    # the established passthrough without using a broad allow-list that would miss no-SNI game TLS.
+    $demuxPassthroughPattern = "^" + [regex]::Escape($DemuxHost) + "(?::443)?$"
+    $interceptionArguments = @(
+        "--ignore-hosts", (Quote-ProcessArgument $demuxPassthroughPattern)
+    )
+    if ($CaptureConnectUi) {
+        # Chromium supplies SNI, so host filtering can protect unrelated WebCore traffic. STEEP's
+        # older TLS stack may not: the game-only pass must decrypt before its HTTP Host is visible.
+        $CaptureHosts = @($RedirectHosts | Where-Object { $_ -ne $DemuxHost })
+        $allowedHostsPattern = "^(?:" + (($CaptureHosts | ForEach-Object {
+            [regex]::Escape($_)
+        }) -join "|") + ")(?::\d+)?$"
+        $interceptionArguments += @(
+            "--allow-hosts", (Quote-ProcessArgument $allowedHostsPattern),
+            # Chromium does not trust a user-installed capture CA for QUIC. Force its TCP fallback.
+            "--set", "http3=false"
+        )
+    }
     $mitmArguments = @(
         "--from", "mitmproxy==$MitmproxyVersion",
         "mitmdump",
-        "--mode", (Quote-ProcessArgument $mode),
-        # The addon filters persistence, while allow-hosts limits TLS interception itself.
-        # Nonmatching traffic is relayed without decryption.
-        "--allow-hosts", (Quote-ProcessArgument $allowedHostsPattern),
+        "--mode", (Quote-ProcessArgument $mode)
+    )
+    $mitmArguments += $interceptionArguments
+    $mitmArguments += @(
         "-s", (Quote-ProcessArgument $addonPath),
         "--set", (Quote-ProcessArgument "powder_recordings=$recordingsRoot"),
         "--set", (Quote-ProcessArgument "confdir=$confDir"),
         "--set", (Quote-ProcessArgument "powder_shutdown_file=$shutdownFile"),
-        # Ubisoft Connect is Chromium-based. Chromium does not trust a
-        # user-installed capture CA for QUIC, but it does for TCP/TLS. Have
-        # mitmproxy drop QUIC handshakes so Connect falls back to HTTP/2 or
-        # HTTP/1 over TCP, which remains fully captured.
-        "--set", "http3=false",
+        "--set", (Quote-ProcessArgument "powder_ready_file=$readyFile"),
         "--set", "flow_detail=0"
     )
     $mitmProcess = Start-Process -FilePath $uvx.Source -ArgumentList $mitmArguments -WorkingDirectory $repoRoot `
@@ -392,15 +458,32 @@ try {
 
     $deadline = [DateTime]::UtcNow.AddSeconds(90)
     while (-not (Test-Path -LiteralPath $caCertificate -PathType Leaf) -or
-           -not (Test-Path -LiteralPath $recorderJournal -PathType Leaf)) {
+           -not (Test-Path -LiteralPath $readyFile -PathType Leaf)) {
         $mitmProcess.Refresh()
         if ($mitmProcess.HasExited) {
-            throw "mitmproxy exited before its CA and recorder were ready (exit code $($mitmProcess.ExitCode))."
+            $mitmProcess.WaitForExit()
+            $mitmExitCode = $mitmProcess.ExitCode
+            if ($null -eq $mitmExitCode) {
+                throw "mitmproxy exited before its CA and recorder were ready, but Windows did not provide its exit code."
+            }
+            throw "mitmproxy exited before its CA and recorder were ready (exit code $mitmExitCode)."
         }
         if ([DateTime]::UtcNow -gt $deadline) {
             throw "Timed out waiting for mitmproxy's CA and recorder addon."
         }
         Start-Sleep -Milliseconds 250
+    }
+
+    # Both files are published asynchronously. Recheck the child after observing them so an
+    # immediately failed startup cannot reach certificate trust or launch the attachment helper.
+    $mitmProcess.Refresh()
+    if ($mitmProcess.HasExited) {
+        $mitmProcess.WaitForExit()
+        $mitmExitCode = $mitmProcess.ExitCode
+        if ($null -eq $mitmExitCode) {
+            throw "mitmproxy exited after reporting readiness, but Windows did not provide its exit code."
+        }
+        throw "mitmproxy exited after reporting readiness (exit code $mitmExitCode)."
     }
 
     $thumbprint = Get-CertificateThumbprint $caCertificate
@@ -436,16 +519,28 @@ try {
     while ($true) {
         $mitmProcess.Refresh()
         if ($mitmProcess.HasExited) {
-            if ($mitmProcess.ExitCode -ne 0) {
-                throw "mitmproxy exited with code $($mitmProcess.ExitCode)."
+            # Start-Process -PassThru can leave ExitCode unset on Windows PowerShell until
+            # WaitForExit() has populated the native process status.
+            $mitmProcess.WaitForExit()
+            $mitmExitCode = $mitmProcess.ExitCode
+            if ($null -eq $mitmExitCode) {
+                throw "mitmproxy exited, but Windows did not provide its exit code."
+            }
+            if ($mitmExitCode -ne 0) {
+                throw "mitmproxy exited with code $mitmExitCode."
             }
             break
         }
         if (-not $attachFinished -and $null -ne $attachProcess) {
             $attachProcess.Refresh()
             if ($attachProcess.HasExited) {
-                if ($attachProcess.ExitCode -ne 0) {
-                    throw "The Steep TLS-helper watcher exited with code $($attachProcess.ExitCode). Do not continue the game through the title screen."
+                $attachProcess.WaitForExit()
+                $attachExitCode = $attachProcess.ExitCode
+                if ($null -eq $attachExitCode) {
+                    throw "The Steep TLS-helper watcher exited, but Windows did not provide its exit code."
+                }
+                if ($attachExitCode -ne 0) {
+                    throw "The Steep TLS-helper watcher exited with code $attachExitCode. Do not continue the game through the title screen."
                 }
                 $attachFinished = $true
                 Write-Host "Steep closed; the network recorder is still running until you press Ctrl+C."

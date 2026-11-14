@@ -14,15 +14,16 @@ to redistribute it.
 selected processes at the networking layer, so it works even though Steep ignores ordinary WinINet,
 `HTTP_PROXY`, or explicit-proxy settings. Earlier explicit-proxy/Wine experiments are not a substitute for
 this workflow. By default only `Steep.exe` is redirected. Ubisoft Connect's login/session processes remain
-entirely outside mitmproxy so that its proprietary connections use native sockets. Interception within the
-game process is restricted to Powder's pack-relevant HTTP hosts; unrelated traffic is relayed without TLS
-interception.
+entirely outside mitmproxy so that its proprietary connections use native sockets. STEEP's older TLS stack
+may not expose a hostname before decryption, so the game-only pass processes TLS from STEEP and the addon
+persists responses only for Powder's fixed pack-host allow-list. Unrelated game traffic is not recorded.
+The known-incompatible `dmx.upc.ubisoft.com` TLS service retains its narrow passthrough.
 
 The runner:
 
 1. Refuses to start while Steep/Ubisoft Connect are open or Powder's hosts-file redirect is present.
-2. Starts mitmproxy for `Steep.exe` and intercepts only the HTTP hosts used as game pack sources. Windows
-   may request elevation for mitmproxy's packet redirector. Connect remains outside the redirector.
+2. Starts mitmproxy for the case variants of `Steep.exe`. Windows may request elevation for mitmproxy's
+   packet redirector. Connect remains outside the redirector, and only allow-listed pack responses are saved.
 3. Creates an isolated mitmproxy CA under the selected recordings directory, installs that exact CA in
    the current user's trusted roots, and starts Powder's existing Steep TLS helper. The helper is needed
    because Steep TU7 uses pinned, statically linked OpenSSL.
@@ -85,9 +86,13 @@ the script prints **Recorder ready**. The TLS watcher waits up to 15 minutes for
 7. Press Ctrl+C in the capture console. Wait for confirmation that the temporary CA and private key were
    removed.
 
-The console prints a privacy-safe progress line whenever a new HTTP fixture is saved. It shows only the
-game/Connect classification, HTTP status, and aggregate counts; it never prints URLs, query strings,
-headers, account IDs, or response contents. Normal mitmproxy flow output remains hidden.
+The console prints privacy-safe milestones for the first redirected connection, decoded HTTP request,
+pack-host request, and each newly saved fixture. The final transport summary shows only aggregate counts;
+it never prints addresses, URLs, query strings, headers, account IDs, or response contents. Normal
+mitmproxy flow output remains hidden. If a run still records nothing, those counts distinguish the stage:
+zero redirected connections means process selection failed; connections but no HTTP requests means TLS or
+protocol handling failed; pack-host requests but no new saves means replies were absent, unusable, or
+already present from an earlier run. `capture-report.json` distinguishes existing data from missing data.
 
 The default pass deliberately does not capture Connect itself. This is sufficient to build the core pack,
 but `capture-report.json` will warn that achievement definitions and exact Connect product metadata are
@@ -98,11 +103,11 @@ capture, run a second pass against the same recordings directory:
 powershell -ExecutionPolicy Bypass -File tools\capture\capture.ps1 -Recordings .\recordings -CaptureConnectUi
 ```
 
-This adds only Connect's Chromium WebCore processes to local capture. Its core login/session executables
-remain outside mitmproxy. During this optional pass, open the Connect overlay with Shift+F2, select Steep,
-open Achievements, and wait for the names and icons to load. Also open Steep's game/details and owned-DLC
-views. If the optional pass makes the Connect UI report offline, stop it and keep the default-pass data;
-the optional warnings do not prevent a pack build.
+This pass captures only Connect's Chromium WebCore processes and applies a hostname prefilter. Its core
+login/session executables remain outside mitmproxy. During this optional pass, open the Connect overlay
+with Shift+F2, select Steep, open Achievements, and wait for the names and icons to load. Also open Steep's
+game/details and owned-DLC views. If the optional pass makes the Connect UI report offline, stop it and
+keep the default-pass data; the optional warnings do not prevent a pack build.
 
 The recorder is resumable: running it again with the same recordings directory merges exact new replies
 and preserves distinct response bodies. Read `recordings/capture-report.json` after every pass. In
@@ -152,11 +157,11 @@ Use that recovery command after updating if an older runner stopped with a `task
 `NativeCommandError`. Do not delete the recordings directory first: each accepted response is flushed to
 `capture-journal.jsonl`, and cleanup replays that journal into the canonical JSON files and report.
 
-Cleanup reads `.powder-capture-state.json`, verifies recorded process start times before stopping anything,
-replays the crash journal into the canonical JSON files, removes only the recorded CA thumbprint, and
-deletes only the `.powder-capture-mitmproxy` subdirectory. It does not delete recordings. If a child cannot
-be verified/stopped or certificate removal fails, the state and CA directory are retained so the operation
-can be retried.
+Cleanup binds `.powder-capture-state.json` to the selected recordings path, requires its CA thumbprint to
+match the isolated CA file, and verifies recorded process start times before stopping anything. It replays
+the crash journal into the canonical JSON files, removes only that verified CA, and deletes only the
+`.powder-capture-mitmproxy` subdirectory. It does not delete recordings. If any evidence is missing, a child
+cannot be verified/stopped, or certificate removal fails, the state and CA directory are retained.
 
 If the capture console reports `Client QUIC handshake failed` with `CERTIFICATE_VERIFY_FAILED`, verify that
 the runner contains the `http3=false` option and update the capture-tool branch. Do not work around this by

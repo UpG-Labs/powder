@@ -1,13 +1,14 @@
 import base64
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from powder.server.constants import APP_ID, CONNECT_APP_ID, SPACE_ID
 from powder.server.gamedata.build import _products, build
 from powder.server.transport.demux import pb
-from tools.capture.recorder import RecordingStore, classify_http
+from tools.capture.recorder import RecordingStore, classify_http, request_http_host
 
 
 HOST = "public-ubiservices.ubi.com"
@@ -17,14 +18,25 @@ PLAYER = "00000000-0000-4000-8000-000000000001"
 def test_windows_runner_avoids_unproxyable_connect_transports():
     runner = Path(__file__).parents[1] / "tools" / "capture" / "capture.ps1"
     script = runner.read_text(encoding="utf-8")
+    assert '"Steep.exe"' in script and '"steep.exe"' in script and '"STEEP.EXE"' in script
+    assert '$CaptureProcessNames = @($ConnectUiProcessNames)' in script
+    assert '$demuxPassthroughPattern = "^" + [regex]::Escape($DemuxHost) + "(?::443)?$"' in script
+    assert '"--ignore-hosts", (Quote-ProcessArgument $demuxPassthroughPattern)' in script
+    assert '$interceptionArguments += @(' in script
+    assert '$mitmArguments += $interceptionArguments' in script
     assert '"--set", "http3=false"' in script
     assert '"--allow-hosts", (Quote-ProcessArgument $allowedHostsPattern)' in script
     assert '$CaptureHosts = @($RedirectHosts | Where-Object { $_ -ne $DemuxHost })' in script
-    assert '$CaptureProcessNames = @("Steep.exe")' in script
-    assert '$CaptureProcessNames += $ConnectUiProcessNames' in script
     assert '$mode = "local:" + ($CaptureProcessNames -join ",")' in script
     assert '$mode = "local:" + ($StoppedProcessNames -join ",")' not in script
     assert '"--tcp-hosts"' not in script
+
+    optional_start = script.index("    if ($CaptureConnectUi) {", script.index("$interceptionArguments = @("))
+    arguments_start = script.index("    $mitmArguments = @(", optional_start)
+    optional_block = script[optional_start:arguments_start]
+    assert '"--allow-hosts"' in optional_block and '"http3=false"' in optional_block
+    base_arguments = script[arguments_start:script.index("$mitmArguments += $interceptionArguments")]
+    assert '"--allow-hosts"' not in base_arguments and '"http3=false"' not in base_arguments
 
 
 def test_windows_runner_does_not_abort_cleanup_on_taskkill_race():
@@ -44,6 +56,82 @@ def test_windows_runner_requests_graceful_mitmdump_shutdown():
     assert 'Stop-RecordedProcess $state.mitmproxy "mitmproxy" 15000' in runner
     assert '"powder_shutdown_file"' in addon
     assert "ctx.master.shutdown()" in addon
+
+
+def test_windows_runner_waits_before_reading_child_exit_codes():
+    runner = Path(__file__).parents[1] / "tools" / "capture" / "capture.ps1"
+    script = runner.read_text(encoding="utf-8")
+    assert script.count("$mitmProcess.WaitForExit()") == 3
+    assert script.count("$mitmExitCode = $mitmProcess.ExitCode") == 3
+    assert "$attachProcess.WaitForExit()\n                $attachExitCode = $attachProcess.ExitCode" in script
+    assert "$($attachProcess.ExitCode)" not in script
+
+
+def test_windows_runner_uses_a_current_run_ready_sentinel():
+    root = Path(__file__).parents[1]
+    runner = (root / "tools" / "capture" / "capture.ps1").read_text(encoding="utf-8")
+    addon = (root / "tools" / "capture" / "addon.py").read_text(encoding="utf-8")
+
+    assert '$readyFile = Join-Path $confDir $ReadyFileName' in runner
+    assert '"powder_ready_file=$readyFile"' in runner
+    assert '-not (Test-Path -LiteralPath $readyFile -PathType Leaf)' in runner
+    assert "$recorderJournal" not in runner
+    assert '"powder_ready_file"' in addon
+    assert "os.replace(temporary, path)" in addon
+
+    running = addon.index("    def running(self) -> None:")
+    watcher = addon.index("self.shutdown_watcher = asyncio.create_task", running)
+    publish = addon.index("_write_ready_sentinel(", watcher)
+    assert watcher < publish
+
+    wait = runner.index("    while (-not (Test-Path -LiteralPath $caCertificate")
+    trust = runner.index("    $thumbprint = Get-CertificateThumbprint", wait)
+    between = runner[wait:trust]
+    assert between.count("$mitmProcess.Refresh()") == 2
+    assert "if ($mitmProcess.HasExited)" in between
+
+
+def test_windows_cleanup_binds_state_before_any_recovery_mutation():
+    runner = Path(__file__).parents[1] / "tools" / "capture" / "capture.ps1"
+    script = runner.read_text(encoding="utf-8")
+    start = script.index("function Invoke-RecoveryCleanup")
+    end = script.index("function Assert-NoRedirectedHosts", start)
+    recovery = script[start:end]
+    first_mutation = recovery.index("$attachStopped = Stop-RecordedProcess")
+
+    for guard in (
+        '$requiredStateProperties = @("format", "recordings", "confdir", "ca_thumbprint", "attach", "mitmproxy")',
+        "$validFormatType = $state.format -is [int] -or $state.format -is [long]",
+        "$recordedRecordings = Get-CanonicalRecoveryPath $state.recordings",
+        "$recordedConfDir = Get-CanonicalRecoveryPath $state.confdir",
+        '$thumbprint -notmatch "^[0-9A-Fa-f]{40}$"',
+        "$certificateThumbprint = Get-CertificateThumbprint $caFile",
+        "$thumbprint.ToUpperInvariant() -ne $certificateThumbprint",
+    ):
+        assert recovery.index(guard) < first_mutation
+    assert recovery.index("Remove-CaptureCertificate $thumbprint") > first_mutation
+
+
+def test_addon_reports_privacy_safe_capture_stages():
+    addon = (Path(__file__).parents[1] / "tools" / "capture" / "addon.py").read_text(encoding="utf-8")
+    assert "first redirected client connection" in addon
+    assert "first redirected HTTP request" in addon
+    assert "first pack-host HTTP request" in addon
+    assert "Powder capture transport summary" in addon
+
+
+def test_addon_uses_http_authority_in_local_transparent_mode():
+    # Local capture's transparent HTTP layer exposes the original destination IP
+    # as Request.host. Request.pretty_host recovers Host/:authority after TLS.
+    request = SimpleNamespace(host="203.132.26.96", pretty_host=f"{HOST}.")
+    assert request_http_host(request) == HOST
+
+    # Keep a safe fallback for request-like objects without mitmproxy's helper.
+    assert request_http_host(SimpleNamespace(host=f"{HOST}:443")) == HOST
+
+    addon = (Path(__file__).parents[1] / "tools" / "capture" / "addon.py").read_text(encoding="utf-8")
+    assert addon.count("request_http_host(flow.request)") == 2
+    assert "_host(flow.request.host)" not in addon
 
 
 def _body(value):

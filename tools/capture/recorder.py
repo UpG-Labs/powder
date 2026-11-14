@@ -42,6 +42,26 @@ REQUIRED_GAME_ENDPOINTS = {
 }
 
 
+def normalize_host(value: str | None) -> str:
+    """Normalize a DNS/HTTP host without accepting a lookalike suffix."""
+    return (value or "").partition(":")[0].rstrip(".").lower()
+
+
+def request_http_host(request: object) -> str:
+    """Return the HTTP authority even when transparent mode exposes an IP as ``host``.
+
+    mitmproxy's local capture mode sets ``Request.host`` to the original socket
+    destination. ``Request.pretty_host`` deliberately prefers Host/:authority,
+    which is the name Powder uses to decide whether a response is pack-relevant.
+    The fallback keeps this helper usable with older or minimal request objects.
+    """
+    pretty_host = getattr(request, "pretty_host", None)
+    if isinstance(pretty_host, str) and pretty_host:
+        return normalize_host(pretty_host)
+    host = getattr(request, "host", None)
+    return normalize_host(host if isinstance(host, str) else None)
+
+
 def _matches(rules, method: str, path: str) -> bool:
     base = path.split("?", 1)[0]
     return any(wanted == method and re.fullmatch(pattern, base) for wanted, pattern in rules)

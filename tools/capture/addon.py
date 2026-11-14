@@ -11,6 +11,7 @@ flow and :class:`RecordingStore` reconstructs its frames across arbitrary chunks
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import sys
 from pathlib import Path
@@ -21,10 +22,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from mitmproxy import ctx, http, tcp  # type: ignore[import-not-found]  # provided by mitmdump
+from mitmproxy import connection, ctx, http, tcp  # type: ignore[import-not-found]  # provided by mitmdump
 
 from powder.server.hostnames import DEMUX_HOST, REDIRECT_HOSTS
-from tools.capture.recorder import RecordingStore, classify_http
+from tools.capture.recorder import RecordingStore, classify_http, normalize_host, request_http_host
 
 DEFAULT_MAX_BODY = 32 * 1024 * 1024
 HTTP_HOSTS = frozenset(h.lower() for h in REDIRECT_HOSTS if h != DEMUX_HOST)
@@ -32,9 +33,14 @@ INVENTORY_UPDATE = re.compile(r"^/v1/profiles/[^/?]+/inventory(?:\?|$)")
 SHUTDOWN_POLL_SECONDS = 0.2
 
 
-def _host(value: str | None) -> str:
-    """Normalize an SNI/HTTP host without accepting a lookalike suffix."""
-    return (value or "").partition(":")[0].rstrip(".").lower()
+def _write_ready_sentinel(path: Path) -> None:
+    """Atomically publish that this addon reached mitmproxy's running hook."""
+    temporary = path.with_name(path.name + ".tmp")
+    with open(temporary, "w", encoding="utf-8", newline="\n") as f:
+        f.write("ready\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary, path)
 
 
 def _tcp_host(flow: tcp.TCPFlow) -> str:
@@ -42,10 +48,10 @@ def _tcp_host(flow: tcp.TCPFlow) -> str:
     for conn in (flow.server_conn, flow.client_conn):
         value = getattr(conn, "sni", None)
         if value:
-            return _host(value)
+            return normalize_host(value)
     address = getattr(flow.server_conn, "address", None)
     if isinstance(address, tuple) and address:
-        return _host(str(address[0]))
+        return normalize_host(str(address[0]))
     return ""
 
 
@@ -74,6 +80,10 @@ class PowderCaptureAddon:
         self.store: RecordingStore | None = None
         self.root: Path | None = None
         self.shutdown_watcher: asyncio.Task[None] | None = None
+        self.redirected_connections = 0
+        self.http_requests = 0
+        self.target_requests = 0
+        self.saved_responses = 0
 
     def load(self, loader) -> None:
         loader.add_option(
@@ -93,6 +103,12 @@ class PowderCaptureAddon:
             str,
             "",
             "Private sentinel path used by capture.ps1 to request a graceful shutdown.",
+        )
+        loader.add_option(
+            "powder_ready_file",
+            str,
+            "",
+            "Per-run sentinel path used by capture.ps1 to confirm startup completed.",
         )
 
     def configure(self, updated: set[str]) -> None:
@@ -125,6 +141,12 @@ class PowderCaptureAddon:
             self.shutdown_watcher = asyncio.create_task(
                 self._watch_for_shutdown(sentinel), name="powder-capture-shutdown"
             )
+        ready_configured = str(ctx.options.powder_ready_file or "").strip()
+        if ready_configured:
+            if self.store is None:
+                raise RuntimeError("Powder capture cannot become ready without an open recording store")
+            _write_ready_sentinel(Path(ready_configured).expanduser().resolve())
+            ctx.log.info("Powder capture addon and local redirector are ready.")
 
     async def _watch_for_shutdown(self, sentinel: Path) -> None:
         try:
@@ -138,11 +160,27 @@ class PowderCaptureAddon:
         ctx.log.info("Powder capture received a graceful shutdown request; finalizing recordings.")
         ctx.master.shutdown()
 
+    def client_connected(self, client: connection.Client) -> None:
+        self.redirected_connections += 1
+        if self.redirected_connections == 1:
+            # Do not log peer addresses or process metadata. This line only proves that the
+            # local redirector selected at least one connection from the requested process.
+            ctx.log.info("Powder capture observed its first redirected client connection.")
+
+    def requestheaders(self, flow: http.HTTPFlow) -> None:
+        self.http_requests += 1
+        if self.http_requests == 1:
+            ctx.log.info("Powder capture decoded its first redirected HTTP request.")
+        if request_http_host(flow.request) in HTTP_HOSTS:
+            self.target_requests += 1
+            if self.target_requests == 1:
+                ctx.log.info("Powder capture matched its first pack-host HTTP request.")
+
     def response(self, flow: http.HTTPFlow) -> None:
         store = self.store
         if store is None or flow.response is None:
             return
-        host = _host(flow.request.host)
+        host = request_http_host(flow.request)
         if host not in HTTP_HOSTS:
             return
         try:
@@ -186,6 +224,7 @@ class PowderCaptureAddon:
                 target=target,
             )
             if added:
+                self.saved_responses += 1
                 # Deliberately omit method, host, path, headers, and body. Paths can contain
                 # account IDs and query strings can contain session data.
                 ctx.log.info(
@@ -220,6 +259,13 @@ class PowderCaptureAddon:
         if self.shutdown_watcher is not None and not self.shutdown_watcher.done():
             self.shutdown_watcher.cancel()
         self.shutdown_watcher = None
+        ctx.log.info(
+            "Powder capture transport summary: "
+            f"{self.redirected_connections} redirected connection(s), "
+            f"{self.http_requests} HTTP request(s), "
+            f"{self.target_requests} pack-host request(s), "
+            f"{self.saved_responses} new saved response(s)."
+        )
         if self.store is not None:
             self.store.close()
             self.store = None
