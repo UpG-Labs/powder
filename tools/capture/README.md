@@ -28,7 +28,9 @@ The runner:
    the current user's trusted roots, and starts Powder's existing Steep TLS helper. The helper is needed
    because Steep TU7 uses pinned, statically linked OpenSSL.
 4. Records decoded HTTP replies without request headers. For progress import only, it also pairs the JSON
-   body of Steep inventory-update POSTs with their replies; it does not retain other request bodies.
+   body of Steep inventory-update POSTs with their replies; it does not retain other request bodies. On
+   shutdown it also imports Steep's validated, game-wide achievement-definition archive from Ubisoft
+   Connect's local achievement cache when available; it never reads account or browser cache data.
 5. On exit, stops only the two child processes it started, removes the exact capture CA by thumbprint,
    and deletes the isolated CA private key. It leaves the recordings in place.
 
@@ -95,9 +97,9 @@ protocol handling failed; pack-host requests but no new saves means replies were
 already present from an earlier run. `capture-report.json` distinguishes existing data from missing data.
 
 The default pass deliberately does not capture Connect itself. This is sufficient to build the core pack,
-but `capture-report.json` will warn that achievement definitions and exact Connect product metadata are
-absent. Powder can use its built-in Steep product entries. To attempt the optional achievement/configuration
-capture, run a second pass against the same recordings directory:
+and the shutdown importer can usually obtain achievement definitions from Connect's existing local cache.
+Exact Connect product metadata remains optional; Powder can use its built-in Steep product entries. To
+attempt the optional Connect configuration capture, run a second pass against the same recordings directory:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\capture\capture.ps1 -Recordings .\recordings -CaptureConnectUi
@@ -106,8 +108,21 @@ powershell -ExecutionPolicy Bypass -File tools\capture\capture.ps1 -Recordings .
 This pass captures only Connect's Chromium WebCore processes and applies a hostname prefilter. Its core
 login/session executables remain outside mitmproxy. During this optional pass, open the Connect overlay
 with Shift+F2, select Steep, open Achievements, and wait for the names and icons to load. Also open Steep's
-game/details and owned-DLC views. If the optional pass makes the Connect UI report offline, stop it and
-keep the default-pass data; the optional warnings do not prevent a pack build.
+game/details and owned-DLC views. Modern Connect normally answers this page from GraphQL and a cached
+definition bundle, so a legacy ZIP request may not appear; the local-cache importer handles that case. If
+the optional pass makes the Connect UI report offline, stop it and keep the default-pass data; the optional
+warnings do not prevent a pack build.
+
+To import a bundle into an existing recording directory without repeating a capture, close Ubisoft Connect
+and run:
+
+```powershell
+uv run python -m tools.capture.achievements .\recordings
+```
+
+The importer checks only the `cache\achievements` directories under Connect's ProgramData and LocalAppData
+roots, considers only Steep product IDs 3279 and 3280, and rebuilds the archive from bounded locale, numeric
+PNG, and `achievements.dat` members. It stores no cache path, account state, GraphQL reply, or unrelated file.
 
 The recorder is resumable: running it again with the same recordings directory merges exact new replies
 and preserves distinct response bodies. Read `recordings/capture-report.json` after every pass. In
@@ -127,8 +142,9 @@ uv run powder-server gamedata zip .\steep-gamedata.zip --pack .\gamedata
 ```
 
 The build uses a strict allow-list, removes per-player state from Club actions, derives identifying markers
-from the unkept replies, and refuses to produce a pack if any marker appears in the output. Do not bypass a
-privacy failure. `verify` checks the manifest hashes; use `capture-report.json` for semantic coverage.
+from the unkept replies, and refuses to produce a pack if any marker appears in the output, including inside
+decompressed achievement-archive members. Do not bypass a privacy failure. `verify` checks the manifest
+hashes; use `capture-report.json` for semantic coverage.
 
 ## Privacy
 
@@ -169,9 +185,10 @@ disabling certificate validation: QUIC is not needed for the recording, and the 
 
 ## Protocol limitations
 
-- `fixtures.json` is the core pack's HTTP source. An optional WebCore pass adds Connect configuration and
-  achievement definitions to `connect-fixtures.json`. The tool keeps relevant Ubisoft response bodies
-  locally so Powder's privacy checker can derive personal markers.
+- `fixtures.json` is the core pack's HTTP source. An optional WebCore pass adds Connect configuration to
+  `connect-fixtures.json`; the validated local-cache importer can add the achievement definition bundle.
+  The tool keeps relevant Ubisoft response bodies locally so Powder's privacy checker can derive personal
+  markers.
 - Ubisoft Connect's core processes, including their `dmx.upc.ubisoft.com` connection, are deliberately
   excluded from local capture. Mitmproxy host exclusions still use a user-space relay and therefore are not
   a native network bypass. Demux would only supply exact owned-product/add-on metadata; Powder's built-in

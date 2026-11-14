@@ -8,8 +8,11 @@ GUID in friend lists, profile lookups and leaderboards, and Connect's friends. T
 from __future__ import annotations
 
 import base64
+import io
 import json
 import re
+import zlib
+import zipfile
 from pathlib import Path
 
 from ..transport.demux import pb
@@ -22,6 +25,14 @@ IDENTIFYING_KEYS = {"profileid", "userid", "idonplatform", "nameonplatform", "us
 # here: they also hold game item ids that legitimately appear in the store catalogue; their owner is
 # caught through the profileId key.)
 PEOPLE_PATHS = re.compile(r"/friends|/v3/profiles$|/onlineStatuses|/blocks|harboursocial")
+MAX_ARCHIVE_BYTES = 32 * 1024 * 1024
+MAX_ARCHIVE_ENTRIES = 512
+MAX_ARCHIVE_MEMBER_BYTES = 16 * 1024 * 1024
+MAX_ARCHIVE_EXPANDED_BYTES = 64 * 1024 * 1024
+
+
+class ArchivePrivacyError(ValueError):
+    pass
 
 
 def _walk(value, out: set[str]) -> None:
@@ -102,7 +113,42 @@ def _pack_blobs(root: Path):
         except ValueError:
             continue
         for b in _b64_strings(data):
-            yield f"{path.relative_to(root).as_posix()} (decoded)", b
+            name = f"{path.relative_to(root).as_posix()} (decoded)"
+            yield name, b
+            yield from _archive_members(name, b)
+
+
+def _archive_members(source: str, blob: bytes):
+    """Yield bounded decompressed members so privacy markers cannot hide in a ZIP body."""
+    if not blob.startswith(b"PK"):
+        return
+    if len(blob) > MAX_ARCHIVE_BYTES:
+        raise ArchivePrivacyError(f"{source}: embedded ZIP exceeds the privacy-check limit")
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(blob))
+    except zipfile.BadZipFile as exc:
+        raise ArchivePrivacyError(f"{source}: embedded ZIP is malformed") from exc
+    try:
+        infos = archive.infolist()
+        if not infos or len(infos) > MAX_ARCHIVE_ENTRIES:
+            raise ArchivePrivacyError(f"{source}: embedded ZIP entry count is outside the privacy-check limit")
+        if sum(max(0, info.file_size) for info in infos) > MAX_ARCHIVE_EXPANDED_BYTES:
+            raise ArchivePrivacyError(f"{source}: embedded ZIP expands beyond the privacy-check limit")
+        for info in infos:
+            if info.is_dir():
+                continue
+            if info.flag_bits & 1 or info.file_size < 0 or info.file_size > MAX_ARCHIVE_MEMBER_BYTES:
+                raise ArchivePrivacyError(f"{source}: embedded ZIP member is unsafe to inspect")
+            try:
+                raw = archive.read(info)
+            except (OSError, RuntimeError, NotImplementedError, zlib.error, zipfile.BadZipFile) as exc:
+                raise ArchivePrivacyError(f"{source}: embedded ZIP member failed validation") from exc
+            if len(raw) != info.file_size:
+                raise ArchivePrivacyError(f"{source}: embedded ZIP member changed while reading")
+            # Member names can themselves contain untrusted/account text, so keep diagnostics generic.
+            yield f"{source} (ZIP member)", raw
+    finally:
+        archive.close()
 
 
 def _b64_strings(value):
@@ -129,9 +175,12 @@ def check(root: Path, markers: set[str], allowed: set[str] = frozenset()) -> lis
     needles = [(m, m.encode()) for m in markers - set(allowed) if len(m) >= 6]
     lowered = [(m, n.lower()) for m, n in needles]
     findings = []
-    for name, blob in _pack_blobs(root):
-        low = blob.lower()
-        for m, n in lowered:
-            if n in low:
-                findings.append(f"{name}: {m[:12]}...")
+    try:
+        for name, blob in _pack_blobs(root):
+            low = blob.lower()
+            for m, n in lowered:
+                if n in low:
+                    findings.append(f"{name}: {m[:12]}...")
+    except ArchivePrivacyError as exc:
+        findings.append(str(exc))
     return sorted(set(findings))

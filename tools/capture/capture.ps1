@@ -79,6 +79,19 @@ function Invoke-RecorderFinalizer([string] $UvPath, [string] $Repository, [strin
     }
 }
 
+function Invoke-AchievementCacheImporter([string] $UvPath, [string] $Repository, [string] $RecordingsRoot) {
+    # Connect normally serves the achievement page from GraphQL and reuses its local definition
+    # archive, so opening the page does not reliably make the legacy CDN request observable.
+    Push-Location -LiteralPath $Repository
+    try {
+        & $UvPath run python -m tools.capture.achievements $RecordingsRoot | Out-Host
+        return $LASTEXITCODE
+    }
+    finally {
+        Pop-Location
+    }
+}
+
 function Stop-RecordedProcess($Record, [string] $Label, [int] $GraceMilliseconds = 3000) {
     if ($null -eq $Record -or $null -eq $Record.pid) {
         return $true
@@ -560,6 +573,15 @@ finally {
     }
 
     if ($childrenStopped) {
+        try {
+            $achievementExit = Invoke-AchievementCacheImporter $uv.Source $repoRoot $recordingsRoot
+            if ($achievementExit -ne 0) {
+                Write-Warning "The local Steep achievement definitions could not be imported."
+            }
+        }
+        catch {
+            Write-Warning "The local Steep achievement definitions could not be imported: $_"
+        }
         try {
             $finalizeExit = Invoke-RecorderFinalizer $uv.Source $repoRoot $recordingsRoot
             if ($finalizeExit -ne 0) {

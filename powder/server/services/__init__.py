@@ -90,23 +90,39 @@ class Assets:
     def _achievement_file(self, name: str) -> bytes | None:
         """A file from Ubisoft Connect's achievement definitions in the pack (a zip with '<lang>_loc.txt'
         files of 'id<TAB>name<TAB>description' lines and '<id>.png' icons)."""
-        for e in self.connect_http.entries:
+        # Recording is resumable. Prefer the newest valid bundle so a stale or partial earlier
+        # response cannot shadow a later cache import.
+        for e in reversed(self.connect_http.entries):
             if not (e.path.split("?")[0].endswith(".zip") and "/assets/" in e.path):
                 continue
             try:
                 with zipfile.ZipFile(io.BytesIO(e.body)) as z:
                     return z.read(name)
-            except (zipfile.BadZipFile, KeyError):
+            except (RuntimeError, NotImplementedError, zipfile.BadZipFile, KeyError):
                 continue
         return None
 
     def achievements_file(self) -> str | None:
         """File name of Ubisoft Connect's achievement definitions in the pack (referenced in Steep's product
         configuration; Connect downloads it), or None without one."""
-        for e in self.connect_http.entries:
+        for e in reversed(self.connect_http.entries):
             path = e.path.split("?")[0]
-            if path.endswith(".zip") and "/assets/" in path:
-                return path.rsplit("/", 1)[1]
+            if not (path.endswith(".zip") and "/assets/" in path):
+                continue
+            try:
+                with zipfile.ZipFile(io.BytesIO(e.body)) as z:
+                    names = {name.casefold(): name for name in z.namelist()}
+                    english = names.get("en-us_loc.txt")
+                    icon = next((original for lowered, original in names.items()
+                                 if lowered.endswith(".png") and lowered[:-4].isdigit()), None)
+                    if english is None or icon is None:
+                        continue
+                    # Reading both verifies their CRCs before this filename is handed to Connect.
+                    z.read(english)
+                    z.read(icon)
+            except (KeyError, RuntimeError, NotImplementedError, zipfile.BadZipFile):
+                continue
+            return path.rsplit("/", 1)[1]
         return None
 
     def achievement_names(self, lang: str = "en-US") -> dict[int, tuple[str, str]]:

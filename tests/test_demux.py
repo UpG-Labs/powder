@@ -254,8 +254,17 @@ def test_achievement_names_from_the_pack():
         z.writestr("1.png", b"png")
     zip_entry = HttpFixture("GET", "static3.cdn.ubi.com", "/orbit/uplay_launcher_3_0/assets/abc.zip", 200,
                             "application/zip", buf.getvalue())
-    assets = Assets(connect_http=HttpFixtures([zip_entry]))
+    old_buf = io.BytesIO()
+    with zipfile.ZipFile(old_buf, "w") as z:
+        z.writestr("en-US_loc.txt", "1\tStale title\tStale description\n")
+        z.writestr("1.png", b"old")
+    old_entry = HttpFixture("GET", "static3.cdn.ubi.com", "/orbit/uplay_launcher_3_0/assets/old.zip", 200,
+                            "application/zip", old_buf.getvalue())
+    bad_entry = HttpFixture("GET", "static3.cdn.ubi.com", "/orbit/uplay_launcher_3_0/assets/bad.zip", 200,
+                            "application/zip", b"not a zip")
+    assets = Assets(connect_http=HttpFixtures([old_entry, zip_entry, bad_entry]))
     assert assets.achievement_names() == {1: ("First run", "Do something"), 2: ("Second", "Do more")}
+    assert assets.achievements_file() == "abc.zip"
     assert assets.achievement_names("xx-XX") == {} and Assets().achievement_names() == {}
 
 
